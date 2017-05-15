@@ -25,7 +25,7 @@ function Set-DefaultDisplayProperty {
         $PropertyNames
     )
 
-    $DefaultDisplayPropertySet = New-Object Management.Automation.PSPropertySet(‘DefaultDisplayPropertySet’, [String[]] $PropertyNames)
+    $DefaultDisplayPropertySet = New-Object Management.Automation.PSPropertySet('DefaultDisplayPropertySet', [String[]] $PropertyNames)
     $PSStandardMembers = [Management.Automation.PSMemberInfo[]]@($DefaultDisplayPropertySet)
     Add-Member -InputObject $InputObject -MemberType MemberSet -Name PSStandardMembers -Value $PSStandardMembers
 }

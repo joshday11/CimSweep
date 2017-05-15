@@ -606,7 +606,7 @@ If a shortcut is present in the start menu, an instance of a Win32_ShortcutFile 
     param(
         [Switch]
         $NoProgressBar,
-        
+
         [Alias('Session')]
         [ValidateNotNullOrEmpty()]
         [Microsoft.Management.Infrastructure.CimSession[]]
@@ -761,6 +761,625 @@ Get-CSWmiPersistence only returns output when __FilterToConsumerBinding instance
                     PSComputerName = $_.PSComputerName
                 }
             }
+        }
+    }
+}
+
+function Get-CSComHijackPersistence{
+<#
+.SYNOPSIS
+
+List artifacts of COM hijacking.
+
+Author: Josh Day (@josh__day)
+License: TBD
+
+.DESCRIPTION
+
+Get-CSComHijackPersistence lists all evidence of COM hijacks to include User hive hijacks and "TreatAs" hijacking.
+
+.PARAMETER CimSession
+
+Specifies the CIM session to use for this cmdlet. Enter a variable that contains the CIM session or a command that creates or gets the CIM session, such as the New-CimSession or Get-CimSession cmdlets. For more information, see about_CimSessions.
+
+.PARAMETER OperationTimeoutSec
+
+Specifies the amount of time that the cmdlet waits for a response from the computer.
+
+By default, the value of this parameter is 0, which means that the cmdlet uses the default timeout value for the server.
+
+If the OperationTimeoutSec parameter is set to a value less than the robust connection retry timeout of 3 minutes, network failures that last more than the value of the OperationTimeoutSec parameter are not recoverable, because the operation on the server times out before the client can reconnect.
+
+.EXAMPLE
+
+Get-CSComHijackPersistence
+
+List all artifacts of COM hijacking
+
+.OUTPUTS
+
+CimSweep.ComHijack
+
+Outputs object showing path in registry to COM hijack evidence and specified binary and options (if any)
+
+.NOTES
+
+Get-CSComHijackPersistence only returns output when there is a mismatch between a user hive and local machine hive, or when a TreatAs key has been set, redirecting to an alternate COM registry key.
+#>
+
+    [CmdletBinding()]
+    [OutputType('CimSweep.ComHijack')]
+    param(
+        [Alias('Session')]
+        [ValidateNotNullOrEmpty()]
+        [Microsoft.Management.Infrastructure.CimSession[]]
+        $CimSession,
+
+        [UInt32]
+        [Alias('OT')]
+        $OperationTimeoutSec
+    )
+
+    BEGIN {
+        if (-not $PSBoundParameters['CimSession']) {
+            # i.e. Run the function locally
+            $CimSession = ''
+            # Trick the loop below into thinking there's at least one CimSession
+            $SessionCount = 1
+        } else {
+            $SessionCount = $CimSession.Count
+        }
+
+        filter New-ComHijack {
+        [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+            Param (
+                [Parameter(Position = 0)]
+                [String]
+                $Hive,
+
+                [Parameter(Position = 1)]
+                [String]
+                $SubKey,
+
+                [Parameter(Position = 2)]
+                [String]
+                $PreviousPath,
+
+                [Parameter(Position = 3, Mandatory = $true)]
+                [String]
+                $ImagePath,
+
+                [Parameter(Position = 4)]
+                [String]
+                $Arguments = $null,
+
+                [Parameter(Position = 5, ValueFromPipelineByPropertyName = $True)]
+                [String]
+                $PSComputerName,
+
+                [Parameter(ValueFromPipelineByPropertyName = $True)]
+                [Alias('Session')]
+                [Microsoft.Management.Infrastructure.CimSession]
+                $CimSession
+            )
+
+            $ObjectProperties = [Ordered] @{
+                PSTypeName = 'CimSweep.ComHijack'
+                Path = "$($Hive)\$($SubKey)"
+                PreviousImage = $PreviousPath
+                HijackImagePath = $ImagePath
+                Arguments = $Arguments
+            }
+
+            $DefaultProperties = 'Path', 'PreviousImage', 'HijackImagePath', 'Arguments' -as [Type] 'Collections.Generic.List[String]'
+
+            if ($PSComputerName) {
+                $ObjectProperties['PSComputerName'] = $PSComputerName
+                $DefaultProperties.Add('PSComputerName')
+            } else {
+                $ObjectProperties['PSComputerName'] = $null
+            }
+
+            if ($Session.Id) { $ObjectProperties['CimSession'] = $Session }
+
+            $ComHijack = [PSCustomObject] $ObjectProperties
+
+            Set-DefaultDisplayProperty -InputObject $ComHijack -PropertyNames $DefaultProperties
+
+            $ComHijack
+        }
+
+        $Current = 0
+
+        $Timeout = @{}
+        if ($PSBoundParameters['OperationTimeoutSec']) { $Timeout['OperationTimeoutSec'] = $OperationTimeoutSec }
+    }
+
+    PROCESS {
+        foreach ($Session in $CimSession) {
+
+            #DEBUG timing
+            $timer = [Diagnostics.Stopwatch]::StartNew()
+
+            $ComputerName = $Session.ComputerName
+            if (-not $Session.ComputerName) { $ComputerName = 'localhost' }
+            Write-Progress -Activity 'CimSweep - COM Hijack persistence sweep' -Status "($($Current+1)/$($SessionCount)) Current computer: $ComputerName" -PercentComplete (($Current / $SessionCount) * 100)
+            $Current++
+
+            $CommonArgs = @{}
+
+            if ($Session.Id) { $CommonArgs['CimSession'] = $Session }
+
+            Write-Verbose "[$($Session.ComputerName)] Retrieving instances of COM hijacking...this may take a while."
+
+            $hklm_clsid = @{}
+
+
+            #TODO: revamp this function and wow64 hklm function to increase speed. Current avg time takes about 3 minutes per.
+            Get-CSRegistryKey -Hive HKLM -SubKey 'SOFTWARE\Classes\CLSID' @CommonArgs @Timeout | ForEach-Object {
+                $path = $_.subkey
+                $clsid = $path.split("\")[-1]
+                if ($clsid -ne "CLSID"){
+                    #Process CLSID subkeys
+                    $com_obj = New-Object PSObject
+                    $com_obj | Add-Member -type NoteProperty -name CLSID -value $clsid
+                    $com_obj | Add-Member -type NoteProperty -name subkey -value $path
+
+                    $desc = (Get-CSRegistryValue -Hive HKLM -SubKey $path -ValueType "REG_SZ" @CommonArgs @Timeout | Where-Object { $_.ValueName -eq "(Default)" }).ValueContent
+                    if ($desc -ne $null){
+                        $com_obj | Add-Member -type NoteProperty -name description -value $desc
+                    }
+
+                    Get-CSRegistryKey -Hive HKLM -SubKey $path @CommonArgs @Timeout | ForEach-Object {
+                        $short_name = $_.subkey.split('\')[-1]
+
+                        if ($short_name -match '(inproc(handler|server)|localserver)(32)?'){
+                            $prop_value = (Get-CSRegistryValue -Hive HKLM -SubKey $_.subkey -ValueType "REG_SZ" @CommonArgs @Timeout | Where-Object {
+                                $_.ValueName -eq "(Default)"
+                            }).ValueContent
+                            if ($prop_value -ne $null){
+                                $com_obj | Add-Member -type NoteProperty -name $matches[1] -value $prop_value
+                            }
+                        }
+
+                        elseif ($short_name -match 'scriptleturl'){
+                            $prop_value = (Get-CSRegistryValue -Hive HKLM -SubKey $_.subkey -ValueType "REG_SZ" @CommonArgs @Timeout | Where-Object {
+                                $_.ValueName -eq "(Default)"
+                            }).ValueContent
+                            if ($prop_value -ne $null){
+                                $com_obj | Add-Member -type NoteProperty -name "ScriptletURL" -value $prop_value
+                            }
+                        }
+
+                        elseif ($short_name -match '^treatas'){
+                            $prop_value = (Get-CSRegistryValue -Hive HKLM -SubKey $_.subkey -ValueType "REG_SZ" @CommonArgs @Timeout | Where-Object {
+                                $_.ValueName -eq "(Default)"
+                            }).ValueContent
+                            if ($prop_value -ne $null){
+                                $com_obj | Add-Member -type NoteProperty -name "TreatAs" -value $prop_value
+                            }
+                        }
+                    }
+
+                    $hklm_clsid.add($clsid, $com_obj)
+                }
+            }
+
+            #DEBUG timing
+            #write-host "finished hklm parsing [$($timer.elapsed.minutes).$($timer.elapsed.seconds).$($timer.elapsed.milliseconds) seconds]"
+
+            #TreatAs HKLM -> HKLM hijacking
+            foreach ($item in $hklm_clsid.keys){
+                if (($hklm_clsid[$item].TreatAs -ne $null) -and (($hklm_clsid[$item].InProcServer -ne $null) -or ($hklm_clsid[$item].LocalServer -ne $null) -or ($hklm_clsid[$item].InProcHandler -ne $null))){
+                    if (($hklm_clsid[$hklm_clsid[$item].TreatAs].InProcServer -ne $null) -and ($hklm_clsid[$hklm_clsid[$item].TreatAs].InProcServer -ne $hklm_clsid[$item].InProcServer)){
+                        if ($hklm_clsid[$hklm_clsid[$item].TreatAs].ScriptletURL -ne $null){
+                            New-ComHijack -Hive HKLM -SubKey $hklm_clsid[$item].subkey -PreviousPath $hklm_clsid[$item].InProcServer -ImagePath $hklm_clsid[$hklm_clsid[$item].TreatAs].InProcServer -Arguments $hklm_clsid[$hklm_clsid[$item].TreatAs].ScriptletURL -PSComputerName $computerName
+                        }
+                        else{
+                            New-ComHijack -Hive HKLM -SubKey $hklm_clsid[$item].subkey -PreviousPath $hklm_clsid[$item].InProcServer -ImagePath $hklm_clsid[$hklm_clsid[$item].TreatAs].InProcServer -PSComputerName $computerName
+                        }
+                    }
+                    elseif (($hklm_clsid[$hklm_clsid[$item].TreatAs].LocalServer -ne $null) -and ($hklm_clsid[$hklm_clsid[$item].TreatAs].LocalServer -ne $hklm_clsid[$item].LocalServer)){
+                        New-ComHijack -Hive HKLM -SubKey $hklm_clsid[$item].subkey -PreviousPath $hklm_clsid[$item].LocalServer -ImagePath $hklm_clsid[$hklm_clsid[$item].TreatAs].LocalServer -PSComputerName $computerName
+                    }
+                    elseif (($hklm_clsid[$hklm_clsid[$item].TreatAs].InProcHandler -ne $null) -and ($hklm_clsid[$hklm_clsid[$item].TreatAs].InProcHandler -ne $hklm_clsid[$item].InProcHandler)){
+                        if ($hklm_clsid[$hklm_clsid[$item].TreatAs].ScriptletURL -ne $null){
+                            New-ComHijack -Hive HKLM -SubKey $hklm_clsid[$item].subkey -PreviousPath $hklm_clsid[$item].InProcHandler -ImagePath $hklm_clsid[$hklm_clsid[$item].TreatAs].InProcHandler -Arguments $hklm_clsid[$hklm_clsid[$item].TreatAs].ScriptletURL -PSComputerName $computerName
+                        }
+                        else{
+                            New-ComHijack -Hive HKLM -SubKey $hklm_clsid[$item].subkey -PreviousPath $hklm_clsid[$item].LocalServer -ImagePath $hklm_clsid[$hklm_clsid[$item].TreatAs].InProcHandler -PSComputerName $computerName
+                        }
+                    }
+                }
+            }
+
+            #DEBUG timing
+            #write-host "finished hklm treatAs hijack check [$($timer.elapsed.minutes).$($timer.elapsed.seconds).$($timer.elapsed.milliseconds) seconds]"
+
+            $hklm_wow64_clsid = @{}
+
+            Get-CSRegistryKey -Hive HKLM -SubKey 'SOFTWARE\Classes\WOW6432Node\CLSID' @CommonArgs @Timeout | ForEach-Object {
+                $path = $_.subkey
+                $clsid = $path.split("\")[-1]
+                if ($clsid -ne "CLSID"){
+                    #Process CLSID subkeys
+                    $com_obj = New-Object PSObject
+                    $com_obj | Add-Member -type NoteProperty -name CLSID -value $clsid
+                    $com_obj | Add-Member -type NoteProperty -name subkey -value $path
+
+                    $desc = (Get-CSRegistryValue -Hive HKLM -SubKey $path -ValueType "REG_SZ" @CommonArgs @Timeout | Where-Object { $_.ValueName -eq "(Default)" }).ValueContent
+                    if ($desc -ne $null){
+                        $com_obj | Add-Member -type NoteProperty -name description -value $desc
+                    }
+
+                    Get-CSRegistryKey -Hive HKLM -SubKey $path @CommonArgs @Timeout | ForEach-Object {
+                        $short_name = $_.subkey.split('\')[-1]
+
+                        if ($short_name -match '(inproc(handler|server)|localserver)(32)?'){
+                            $prop_value = (Get-CSRegistryValue -Hive HKLM -SubKey $_.subkey -ValueType "REG_SZ" @CommonArgs @Timeout | Where-Object {
+                                $_.ValueName -eq "(Default)"
+                            }).ValueContent
+                            if ($prop_value -ne $null){
+                                $com_obj | Add-Member -type NoteProperty -name $matches[1] -value $prop_value
+                            }
+                        }
+
+                        elseif ($short_name -match 'scriptleturl'){
+                            $prop_value = (Get-CSRegistryValue -Hive HKLM -SubKey $_.subkey -ValueType "REG_SZ" @CommonArgs @Timeout | Where-Object {
+                                $_.ValueName -eq "(Default)"
+                            }).ValueContent
+                            if ($prop_value -ne $null){
+                                $com_obj | Add-Member -type NoteProperty -name "ScriptletURL" -value $prop_value
+                            }
+                        }
+
+                        elseif ($short_name -match '^treatas'){
+                            $prop_value = (Get-CSRegistryValue -Hive HKLM -SubKey $_.subkey -ValueType "REG_SZ" @CommonArgs @Timeout | Where-Object {
+                                $_.ValueName -eq "(Default)"
+                            }).ValueContent
+                            if ($prop_value -ne $null){
+                                $com_obj | Add-Member -type NoteProperty -name "TreatAs" -value $prop_value
+                            }
+                        }
+                    }
+
+                    $hklm_wow64_clsid.add($clsid, $com_obj)
+                }
+            }
+
+            #DEBUG timing
+            #write-host "finished hklm wow64 parsing [$($timer.elapsed.minutes).$($timer.elapsed.seconds).$($timer.elapsed.milliseconds) seconds]"
+
+            # TreatAs HKLM -> HKLM hijacking (WOW6432Node)
+            foreach ($item in $hklm_wow64_clsid.keys){
+                if (($hklm_wow64_clsid[$item].TreatAs -ne $null) -and (($hklm_wow64_clsid[$item].InProcServer -ne $null) -or ($hklm_wow64_clsid[$item].LocalServer -ne $null) -or ($hklm_wow64_clsid[$item].InProcHandler -ne $null))){
+                    if (($hklm_wow64_clsid[$hklm_wow64_clsid[$item].TreatAs].InProcServer -ne $null) -and ($hklm_wow64_clsid[$hklm_wow64_clsid[$item].TreatAs].InProcServer -ne $hklm_wow64_clsid[$item].InProcServer)){
+                        if ($hklm_wow64_clsid[$hklm_wow64_clsid[$item].TreatAs].ScriptletURL -ne $null){
+                            New-ComHijack -Hive HKLM -SubKey $hklm_wow64_clsid[$item].subkey -PreviousPath $hklm_wow64_clsid[$item].InProcServer -ImagePath $hklm_wow64_clsid[$hklm_wow64_clsid[$item].TreatAs].InProcServer -Arguments $hklm_wow64_clsid[$hklm_wow64_clsid[$item].TreatAs].ScriptletURL -PSComputerName $computerName
+                        }
+                        else{
+                            New-ComHijack -Hive HKLM -SubKey $hklm_wow64_clsid[$item].subkey -PreviousPath $hklm_wow64_clsid[$item].InProcServer -ImagePath $hklm_wow64_clsid[$hklm_wow64_clsid[$item].TreatAs].InProcServer -PSComputerName $computerName
+                        }
+                    }
+                    elseif (($hklm_wow64_clsid[$hklm_wow64_clsid[$item].TreatAs].LocalServer -ne $null) -and ($hklm_wow64_clsid[$hklm_wow64_clsid[$item].TreatAs].LocalServer -ne $hklm_wow64_clsid[$item].LocalServer)){
+                        New-ComHijack -Hive HKLM -SubKey $hklm_wow64_clsid[$item].subkey -PreviousPath $hklm_wow64_clsid[$item].InProcServer -ImagePath $hklm_wow64_clsid[$hklm_wow64_clsid[$item].TreatAs].LocalServer -PSComputerName $computerName
+                    }
+                    elseif (($hklm_wow64_clsid[$hklm_wow64_clsid[$item].TreatAs].InProcHandler -ne $null) -and ($hklm_wow64_clsid[$hklm_wow64_clsid[$item].TreatAs].InProcHandler -ne $hklm_wow64_clsid[$item].InProcHandler)){
+                        if ($hklm_wow64_clsid[$hklm_wow64_clsid[$item].TreatAs].ScriptletURL -ne $null){
+                            New-ComHijack -Hive HKLM -SubKey $hklm_wow64_clsid[$item].subkey -PreviousPath $hklm_wow64_clsid[$item].InProcHandler -ImagePath $hklm_wow64_clsid[$hklm_wow64_clsid[$item].TreatAs].InProcHandler -Arguments $hklm_wow64_clsid[$hklm_wow64_clsid[$item].TreatAs].ScriptletURL -PSComputerName $computerName
+                        }
+                        else{
+                            New-ComHijack -Hive HKLM -SubKey $hklm_wow64_clsid[$item].subkey -PreviousPath $hklm_wow64_clsid[$item].InProcServer -ImagePath $hklm_wow64_clsid[$hklm_wow64_clsid[$item].TreatAs].InProcHandler -PSComputerName $computerName
+                        }
+                    }
+                }
+            }
+
+            #DEBUG timing
+            #write-host "finished hklm wow64 treatAs hijack check [$($timer.elapsed.minutes).$($timer.elapsed.seconds).$($timer.elapsed.milliseconds) seconds]"
+
+            # fix TreatAs redirection
+            foreach ($item in $hklm_clsid.keys){
+                $hklm_clsid[$item] | where-object {
+                    $_.treatas -ne $null
+                } | foreach-object {
+                    if ($hklm_clsid[$_.TreatAs].InProcServer -ne $null){
+                        $hklm_clsid[$_.CLSID] | Add-Member -type noteproperty -name "InProcServer" -value $hklm_clsid[$_.TreatAs].InProcServer -force
+                    }
+                    if ($hklm_clsid[$_.TreatAs].InProcHandler -ne $null){
+                        $hklm_clsid[$_.CLSID] | Add-Member -type noteproperty -name "InProcHandler" -value $hklm_clsid[$_.TreatAs].InProcHandler -force
+                    }
+                    if ($hklm_clsid[$_.TreatAs].LocalServer -ne $null){
+                        $hklm_clsid[$_.CLSID] | Add-Member -type noteproperty -name "LocalServer" -value $hklm_clsid[$_.TreatAs].LocalServer -force
+                    }
+                    if ($hklm_clsid[$_.TreatAs].ScriptletURL -ne $null){
+                        $hklm_clsid[$_.CLSID] | Add-Member -type noteproperty -name "ScriptletURL" -value $hklm_clsid[$_.TreatAs].ScriptletURL -force
+                    }
+                    $temp_treatas = $_.TreatAs
+                    $_.PSObject.Properties.Remove('TreatAs')
+                    if ($hklm_clsid[$temp_treatas].TreatAs -ne $null){
+                        $hklm_clsid[$_.CLSID] | Add-Member -type noteproperty -name "TreatAs" -value $hklm_clsid[$temp_treatas].TreatAs -force
+                    }
+                }
+            }
+
+            # fix TreatAs redirection (WOW6432Node)
+            foreach ($item in $hklm_wow64_clsid.keys){
+                $hklm_wow64_clsid[$item] | where-object {
+                    $_.treatas -ne $null
+                } | foreach-object {
+                    if ($hklm_wow64_clsid[$_.TreatAs].InProcServer -ne $null){
+                        $hklm_wow64_clsid[$_.CLSID] | Add-Member -type noteproperty -name "InProcServer" -value $hklm_wow64_clsid[$_.TreatAs].InProcServer -force
+                    }
+                    if ($hklm_wow64_clsid[$_.TreatAs].InProcHandler -ne $null){
+                        $hklm_wow64_clsid[$_.CLSID] | Add-Member -type noteproperty -name "InProcHandler" -value $hklm_wow64_clsid[$_.TreatAs].InProcHandler -force
+                    }
+                    if ($hklm_wow64_clsid[$_.TreatAs].LocalServer -ne $null){
+                        $hklm_wow64_clsid[$_.CLSID] | Add-Member -type noteproperty -name "LocalServer" -value $hklm_wow64_clsid[$_.TreatAs].LocalServer -force
+                    }
+                    if ($hklm_wow64_clsid[$_.TreatAs].ScriptletURL -ne $null){
+                        $hklm_wow64_clsid[$_.CLSID] | Add-Member -type noteproperty -name "ScriptletURL" -value $hklm_wow64_clsid[$_.TreatAs].ScriptletURL -force
+                    }
+                    $temp_treatas = $_.TreatAs
+                    $_.PSObject.Properties.Remove('TreatAs')
+                    if ($hklm_wow64_clsid[$temp_treatas].TreatAs -ne $null){
+                        $hklm_wow64_clsid[$_.CLSID] | Add-Member -type noteproperty -name "TreatAs" -value $hklm_wow64_clsid[$temp_treatas].TreatAs -force
+                    }
+                }
+            }
+
+            #DEBUG timing
+            #write-host "finished hklm treatAs redirection fix [$($timer.elapsed.minutes).$($timer.elapsed.seconds).$($timer.elapsed.milliseconds) seconds]"
+
+            # Get the SIDS for each user in the registry
+            $HKUSIDs = Get-HKUSID @CommonArgs @Timeout
+
+            foreach ($sid in $HKUSIDs){
+                $hku_clsid = @{}
+
+                #TODO: revamp this function and wow64 hku function to increase speed. Current avg time takes about 35 seconds per.
+                Get-CSRegistryKey -Hive HKU -SubKey "$sid\SOFTWARE\Classes\CLSID" @CommonArgs @Timeout | ForEach-Object {
+                    $path = $_.subkey
+                    $clsid = $path.split("\")[-1]
+                    if ($clsid -ne "CLSID"){
+                        #Process CLSID subkeys
+                        $com_obj = New-Object PSObject
+                        $com_obj | Add-Member -type NoteProperty -name CLSID -value $clsid
+                        $com_obj | Add-Member -type NoteProperty -name subkey -value $path
+
+                        $desc = (Get-CSRegistryValue -Hive HKU -SubKey $path -ValueType "REG_SZ" @CommonArgs @Timeout | Where-Object { $_.ValueName -eq "(Default)" }).ValueContent
+                        if ($desc -ne $null){
+                            $com_obj | Add-Member -type NoteProperty -name description -value $desc
+                        }
+
+                        Get-CSRegistryKey -Hive HKU -SubKey $path @CommonArgs @Timeout | ForEach-Object {
+                            $short_name = $_.subkey.split('\')[-1]
+
+                            if ($short_name -match '(inproc(handler|server)|localserver)(32)?'){
+                                $prop_value = (Get-CSRegistryValue -Hive HKU -SubKey $_.subkey -ValueType "REG_SZ" @CommonArgs @Timeout | Where-Object {
+                                    $_.ValueName -eq "(Default)"
+                                }).ValueContent
+                                if ($prop_value -ne $null){
+                                    $com_obj | Add-Member -type NoteProperty -name $matches[1] -value $prop_value
+                                }
+                            }
+
+                            elseif ($short_name -match 'scriptleturl'){
+                                $prop_value = (Get-CSRegistryValue -Hive HKU -SubKey $_.subkey -ValueType "REG_SZ" @CommonArgs @Timeout | Where-Object {
+                                    $_.ValueName -eq "(Default)"
+                                }).ValueContent
+                                if ($prop_value -ne $null){
+                                    $com_obj | Add-Member -type NoteProperty -name "ScriptletURL" -value $prop_value
+                                }
+                            }
+
+                            elseif ($short_name -match '^treatas'){
+                                $prop_value = (Get-CSRegistryValue -Hive HKU -SubKey $_.subkey -ValueType "REG_SZ" @CommonArgs @Timeout | Where-Object {
+                                    $_.ValueName -eq "(Default)"
+                                }).ValueContent
+                                if ($prop_value -ne $null){
+                                    $com_obj | Add-Member -type NoteProperty -name "TreatAs" -value $prop_value
+                                }
+                            }
+                        }
+
+                        $hku_clsid.add($clsid, $com_obj)
+                    }
+                }
+
+                #DEBUG timing
+                #write-host "finished hku parsing for $sid user [$($timer.elapsed.minutes).$($timer.elapsed.seconds).$($timer.elapsed.milliseconds) seconds]"
+
+                # fix up TreatAs redirection
+                foreach ($item in $hku_clsid.keys){
+                    $hku_clsid[$item] | where-object {
+                        $_.treatas -ne $null
+                    } | foreach-object {
+                        if ($hku_clsid[$_.TreatAs].InProcServer -ne $null){
+                            $hku_clsid[$_.CLSID] | Add-Member -type noteproperty -name "InProcServer" -value $hku_clsid[$_.TreatAs].InProcServer -force
+                        }
+                        if ($hku_clsid[$_.TreatAs].InProcHandler -ne $null){
+                            $hku_clsid[$_.CLSID] | Add-Member -type noteproperty -name "InProcHandler" -value $hku_clsid[$_.TreatAs].InProcHandler -force
+                        }
+                        if ($hku_clsid[$_.TreatAs].LocalServer -ne $null){
+                            $hku_clsid[$_.CLSID] | Add-Member -type noteproperty -name "LocalServer" -value $hku_clsid[$_.TreatAs].LocalServer -force
+                        }
+                        if ($hku_clsid[$_.TreatAs].ScriptletURL -ne $null){
+                            $hku_clsid[$_.CLSID] | Add-Member -type noteproperty -name "ScriptletURL" -value $hku_clsid[$_.TreatAs].ScriptletURL -force
+                        }
+                        $temp_treatas = $_.TreatAs
+                        $_.PSObject.Properties.Remove('TreatAs')
+                        if ($hku_clsid[$temp_treatas].TreatAs -ne $null){
+                            $hku_clsid[$_.CLSID] | Add-Member -type noteproperty -name "TreatAs" -value $hku_clsid[$temp_treatas].TreatAs -force
+                        }
+                    }
+                }
+
+                #DEBUG timing
+                #write-host "finished hku treatAs redirection for $sid [$($timer.elapsed.minutes).$($timer.elapsed.seconds).$($timer.elapsed.milliseconds) seconds]"
+
+                #TODO: repeat above steps as long as necessary (do..while ($still_treatAs -ne $null))
+                #$still_treatAs = foreach ($item in $hklm_clsid.keys){$hklm_clsid[$item] | where-object {$_.treatas -ne $null} }
+
+                # do comparison here against hklm
+                foreach ($item in $hku_clsid.Keys){
+                    if ($hklm_clsid.containskey($item)){
+                        if (($hklm_clsid[$item].InProcServer -ne $null) -and ($hku_clsid[$item].InProcServer -ne $null)){
+                            if ($hklm_clsid[$item].InProcServer.tolower() -ne $hku_clsid[$item].InProcServer.tolower()){
+                                if ($hku_clsid[$item].ScriptletURL -ne $null){
+                                    New-ComHijack -Hive HKU -SubKey $hku_clsid[$item].subkey -PreviousPath $hklm_clsid[$item].InProcServer -ImagePath $hku_clsid[$item].InProcServer -Arguments $hku_clsid[$item].ScriptletURL -PSComputerName $computerName
+                                }
+                                else{
+                                    New-ComHijack -Hive HKU -SubKey $hku_clsid[$item].subkey -PreviousPath $hklm_clsid[$item].InProcServer -ImagePath $hku_clsid[$item].InProcServer -PSComputerName $computerName
+                                }
+                            }
+                        }
+                        if (($hklm_clsid[$item].LocalServer -ne $null) -and ($hku_clsid[$item].LocalServer -ne $null)){
+                            if ($hklm_clsid[$item].LocalServer.tolower() -ne $hku_clsid[$item].LocalServer.tolower()){
+                                New-ComHijack -Hive HKU -SubKey $hku_clsid[$item].subkey -PreviousPath $hklm_clsid[$item].LocalServer -ImagePath $hku_clsid[$item].LocalServer -PSComputerName $computerName
+                            }
+                        }
+                        if (($hklm_clsid[$item].InProcHandler -ne $null) -and ($hku_clsid[$item].InProcHandler -ne $null)){
+                            if ($hklm_clsid[$item].InProcHandler.tolower() -ne $hku_clsid[$item].InProcHandler.tolower()){
+                                if ($hku_clsid[$item].ScriptletURL -ne $null){
+                                    New-ComHijack -Hive HKU -SubKey $hku_clsid[$item].subkey -PreviousPath $hklm_clsid[$item].InProcHandler -ImagePath $hku_clsid[$item].InProcHandler -Arguments $hku_clsid[$item].ScriptletURL -PSComputerName $computerName
+                                }
+                                else{
+                                    New-ComHijack -Hive HKU -SubKey $hku_clsid[$item].subkey -PreviousPath $hklm_clsid[$item].InProcHandler -ImagePath $hku_clsid[$item].InProcHandler -PSComputerName $computerName
+                                }
+                            }
+                        }
+                    }
+                }
+
+                #DEBUG timing
+                #write-host "finished hku hijack check for $sid [$($timer.elapsed.minutes).$($timer.elapsed.seconds).$($timer.elapsed.milliseconds) seconds]"
+            }
+
+            # do wow64 lookups and comparison
+            foreach ($sid in $HKUSIDs){
+                $hku_wow64_clsid = @{}
+
+                Get-CSRegistryKey -Hive HKU -SubKey "$sid\SOFTWARE\Classes\WOW6432Node\CLSID" @CommonArgs @Timeout | ForEach-Object {
+                    $path = $_.subkey
+                    $clsid = $path.split("\")[-1]
+                    if ($clsid -ne "CLSID"){
+                        #Process CLSID subkeys
+                        $com_obj = New-Object PSObject
+                        $com_obj | Add-Member -type NoteProperty -name CLSID -value $clsid
+                        $com_obj | Add-Member -type NoteProperty -name subkey -value $path
+
+                        $desc = (Get-CSRegistryValue -Hive HKU -SubKey $path -ValueType "REG_SZ" @CommonArgs @Timeout | Where-Object { $_.ValueName -eq "(Default)" }).ValueContent
+                        if ($desc -ne $null){
+                            $com_obj | Add-Member -type NoteProperty -name description -value $desc
+                        }
+
+                        Get-CSRegistryKey -Hive HKU -SubKey $path @CommonArgs @Timeout | ForEach-Object {
+                            $short_name = $_.subkey.split('\')[-1]
+
+                            if ($short_name -match '(inproc(handler|server)|localserver)(32)?'){
+                                $prop_value = (Get-CSRegistryValue -Hive HKU -SubKey $_.subkey -ValueType "REG_SZ" @CommonArgs @Timeout | Where-Object {
+                                    $_.ValueName -eq "(Default)"
+                                }).ValueContent
+                                if ($prop_value -ne $null){
+                                    $com_obj | Add-Member -type NoteProperty -name $matches[1] -value $prop_value
+                                }
+                            }
+
+                            elseif ($short_name -match 'scriptleturl'){
+                                $prop_value = (Get-CSRegistryValue -Hive HKU -SubKey $_.subkey -ValueType "REG_SZ" @CommonArgs @Timeout | Where-Object {
+                                    $_.ValueName -eq "(Default)"
+                                }).ValueContent
+                                if ($prop_value -ne $null){
+                                    $com_obj | Add-Member -type NoteProperty -name "ScriptletURL" -value $prop_value
+                                }
+                            }
+
+                            elseif ($short_name -match '^treatas'){
+                                $prop_value = (Get-CSRegistryValue -Hive HKU -SubKey $_.subkey -ValueType "REG_SZ" @CommonArgs @Timeout | Where-Object {
+                                    $_.ValueName -eq "(Default)"
+                                }).ValueContent
+                                if ($prop_value -ne $null){
+                                    $com_obj | Add-Member -type NoteProperty -name "TreatAs" -value $prop_value
+                                }
+                            }
+                        }
+
+                        $hku_wow64_clsid.add($clsid, $com_obj)
+                    }
+                }
+
+                #DEBUG timing
+                #write-host "finished hku wow64 parsing for $sid user [$($timer.elapsed.minutes).$($timer.elapsed.seconds).$($timer.elapsed.milliseconds) seconds]"
+
+                # fix up TreatAs redirection
+                foreach ($item in $hku_wow64_clsid.keys){
+                    $hku_wow64_clsid[$item] | where-object {
+                        $_.treatas -ne $null
+                    } | foreach-object {
+                        if ($hku_wow64_clsid[$_.TreatAs].InProcServer -ne $null){
+                            $hku_wow64_clsid[$_.CLSID] | Add-Member -type noteproperty -name "InProcServer" -value $hku_wow64_clsid[$_.TreatAs].InProcServer -force
+                        }
+                        if ($hku_wow64_clsid[$_.TreatAs].InProcHandler -ne $null){
+                            $hku_wow64_clsid[$_.CLSID] | Add-Member -type noteproperty -name "InProcHandler" -value $hku_wow64_clsid[$_.TreatAs].InProcHandler -force
+                        }
+                        if ($hku_wow64_clsid[$_.TreatAs].LocalServer -ne $null){
+                            $hku_wow64_clsid[$_.CLSID] | Add-Member -type noteproperty -name "LocalServer" -value $hku_wow64_clsid[$_.TreatAs].LocalServer -force
+                        }
+                        if ($hku_wow64_clsid[$_.TreatAs].ScriptletURL -ne $null){
+                            $hku_wow64_clsid[$_.CLSID] | Add-Member -type noteproperty -name "ScriptletURL" -value $hku_wow64_clsid[$_.TreatAs].ScriptletURL -force
+                        }
+                        $temp_treatas = $_.TreatAs
+                        $_.PSObject.Properties.Remove('TreatAs')
+                        if ($hku_wow64_clsid[$temp_treatas].TreatAs -ne $null){
+                            $hku_wow64_clsid[$_.CLSID] | Add-Member -type noteproperty -name "TreatAs" -value $hku_wow64_clsid[$temp_treatas].TreatAs -force
+                        }
+                    }
+                }
+
+                #DEBUG timing
+                #write-host "finished hku wow64 treatAs redirection for $sid [$($timer.elapsed.minutes).$($timer.elapsed.seconds).$($timer.elapsed.milliseconds) seconds]"
+
+                #TODO: repeat above steps as long as necessary (do..while ($still_treatAs -ne $null))
+                #$still_treatAs = foreach ($item in $hklm_wow64_clsid.keys){$hklm_wow64_clsid[$item] | where-object {$_.treatas -ne $null} }
+
+                # do comparison here against hklm
+                foreach ($item in $hku_wow64_clsid.Keys){
+                    if ($hklm_wow64_clsid.containskey($item)){
+                        if (($hklm_wow64_clsid[$item].InProcServer -ne $null) -and ($hku_wow64_clsid[$item].InProcServer -ne $null)){
+                            if ($hklm_wow64_clsid[$item].InProcServer.tolower() -ne $hku_wow64_clsid[$item].InProcServer.tolower()){
+                                if ($hku_wow64_clsid[$item].ScriptletURL -ne $null){
+                                    New-ComHijack -Hive HKU -SubKey $hku_wow64_clsid[$item].subkey -PreviousPath $hklm_wow64_clsid[$item].InProcServer -ImagePath $hku_wow64_clsid[$item].InProcServer -Arguments $hku_wow64_clsid[$item].ScriptletURL -PSComputerName $computerName
+                                }
+                                else{
+                                    New-ComHijack -Hive HKU -SubKey $hku_wow64_clsid[$item].subkey -PreviousPath $hklm_wow64_clsid[$item].InProcServer -ImagePath $hku_wow64_clsid[$item].InProcServer -PSComputerName $computerName
+                                }
+                            }
+                        }
+                        if (($hklm_wow64_clsid[$item].LocalServer -ne $null) -and ($hku_wow64_clsid[$item].LocalServer -ne $null)){
+                            if ($hklm_wow64_clsid[$item].LocalServer.tolower() -ne $hku_wow64_clsid[$item].LocalServer.tolower()){
+                                New-ComHijack -Hive HKU -SubKey $hku_wow64_clsid[$item].subkey -PreviousPath $hklm_wow64_clsid[$item].LocalServer -ImagePath $hku_wow64_clsid[$item].LocalServer -PSComputerName $computerName
+                            }
+                        }
+                        if (($hklm_wow64_clsid[$item].InProcHandler -ne $null) -and ($hku_wow64_clsid[$item].InProcHandler -ne $null)){
+                            if ($hklm_wow64_clsid[$item].InProcHandler.tolower() -ne $hku_wow64_clsid[$item].InProcHandler.tolower()){
+                                if ($hku_wow64_clsid[$item].ScriptletURL -ne $null){
+                                    New-ComHijack -Hive HKU -SubKey $hku_wow64_clsid[$item].subkey -PreviousPath $hklm_wow64_clsid[$item].InProcHandler -ImagePath $hku_wow64_clsid[$item].InProcHandler -Arguments $hku_wow64_clsid[$item].ScriptletURL -PSComputerName $computerName
+                                }
+                                else{
+                                    New-ComHijack -Hive HKU -SubKey $hku_wow64_clsid[$item].subkey -PreviousPath $hklm_wow64_clsid[$item].InProcHandler -ImagePath $hku_wow64_clsid[$item].InProcHandler -PSComputerName $computerName
+                                }
+                            }
+                        }
+                    }
+                }
+
+                #DEBUG timing
+                #write-host "finished hku wow64 hijack comparison for $sid [$($timer.elapsed.minutes).$($timer.elapsed.seconds).$($timer.elapsed.milliseconds) seconds]"
+            }
+            $timer.Stop()
+            #DEBUG timing
+            write-host "finished everything for session [$($timer.elapsed.minutes).$($timer.elapsed.seconds).$($timer.elapsed.milliseconds) seconds]"
         }
     }
 }
